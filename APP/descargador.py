@@ -1,0 +1,763 @@
+"""StreamFetch · download logic for streamed videos (.m3u8) from any web page (also console mode).
+
+Portable launcher: paths come from this file, never from the folder it is started from.
+
+Project:   StreamFetch v1.0.0 (based on VideoFetch)
+Authors:   Juan Bautista Galisteo Marqués (@juangalisteo)
+           Juan Manuel Casado Triguero (@juanmacasado)
+License:   GPL-3.0-or-later (see LICENSE)
+Copyright (C) 2026 Juan Bautista Galisteo Marqués and Juan Manuel Casado Triguero.
+This program is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License, version 3 or (at your option) any later version.
+"""
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+# Layout: STREAMFETCH\APP (this file), STREAMFETCH\SISTEMA (internal parts)
+# and STREAMFETCH\DOWNLOADS (the videos). Paths do not depend on where the folder is.
+APP = Path(__file__).resolve().parent
+ROOT = APP.parent
+LIB = ROOT / "SISTEMA"
+DOWNLOADS = ROOT / "DOWNLOADS"
+sys.path.insert(0, str(ROOT))  # in case the folder has not been reorganised yet
+sys.path.insert(0, str(LIB))
+sys.path.insert(0, str(APP))
+from idiomas import t, set_language, get_language, LANGUAGES  # noqa: E402  (texts in Spanish and English)
+
+# Known players: the stream lives on a CDN but the server only accepts it if it comes from the page.
+KNOWN_REFERERS = {"tella.tv": "https://www.tella.tv/"}
+# Titles that are not real names (the generic extractor names a stream after its file).
+GENERIC_TITLES = ("manifest", "master", "index", "playlist", "video", "stream", "chunklist", "media")
+
+MEDIA_EXT = "mp4|mkv|webm|mov|m4a|mp3|opus|ogg|wav|aac|flac"
+FILE_RE = re.compile(
+    rf"^(?P<stem>.+?)(?:\.f\d+(?:-\d+)?)?\.(?P<ext>{MEDIA_EXT})(?P<partial>(?:\.part|\.ytdl|\.temp)+)?$",
+    re.IGNORECASE,
+)
+
+
+def section(title):
+    print("\n" + "=" * 68)
+    print("  " + title)
+    print("=" * 68)
+
+
+def collect_urls():
+    section(t("c_step2"))
+    print(t("c_paste"))
+    print(t("c_more"))
+    print(t("c_finish"))
+    print(t("c_exit"))
+    urls = []
+    while True:
+        label = t("c_link", n=len(urls) + 1)
+        if urls:
+            label += t("c_enter_download", n=len(urls))
+        url = input(label + ": ").strip()
+        if url.lower() in ("salir", "exit"):
+            return []
+        if not url:
+            return urls
+        if not url.startswith(("https://", "http://")):
+            print(t("c_invalid_link"))
+            continue
+        if url in urls:
+            print(t("c_duplicate"))
+            continue
+        urls.append(url)
+        print(t("c_added", n=len(urls)))
+        print(t("c_another"))
+
+
+# ── File names and links ──────────────────────────────────────────────────
+def guess_referer(url):
+    """The page a stream link comes from: known players (Tella…) or www.<domain>/ of the link."""
+    host = (urlparse(url).hostname or "").lower()
+    for domain, referer in KNOWN_REFERERS.items():
+        if host == domain or host.endswith("." + domain):
+            return referer
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return f"https://www.{'.'.join(parts[-2:])}/"
+    return None
+
+
+def link_expiry(url):
+    """When a signed link (Amazon CloudFront: Policy= or Expires=) stops working, or None."""
+    import base64
+    import datetime
+    import json
+    from urllib.parse import parse_qs
+    query = parse_qs(urlparse(url).query)
+    stamp = None
+    if "Expires" in query:
+        stamp = query["Expires"][0]
+    elif "Policy" in query:
+        raw = query["Policy"][0].replace("-", "+").replace("_", "=").replace("~", "/")
+        try:
+            policy = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)))
+            stamp = policy["Statement"][0]["Condition"]["DateLessThan"]["AWS:EpochTime"]
+        except Exception:
+            return None
+    try:
+        return datetime.datetime.fromtimestamp(int(stamp))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def base_name(info):
+    """The video title if it is a real one; if not (manifest, index…), "StreamFetch <date>"."""
+    import datetime
+    import yt_dlp
+
+    title = str(info.get("title") or "").strip()
+    if not title or title.casefold() in GENERIC_TITLES or re.fullmatch(r"[\w-]{20,}", title):
+        title = t("default_name", date=f"{datetime.datetime.now():%Y-%m-%d %H.%M}")
+    name = shorten(yt_dlp.utils.sanitize_filename(title, restricted=False))
+    return name or "StreamFetch"
+
+
+def shorten(name, limit=110):
+    """Shortens long names at a whole word, without leaving stray punctuation at the end."""
+    if len(name) > limit:
+        cut = name[:limit]
+        name = cut[:cut.rfind(" ")] if " " in cut[limit // 2:] else cut
+    return name.rstrip(" .,;:-–—(¡¿[{").rstrip()
+
+
+def clean_name(text):
+    """Name typed by the user, without characters Windows does not allow."""
+    import yt_dlp
+    text = re.sub(r'[\\/:*?"<>|]+', "-", str(text)).strip()
+    return yt_dlp.utils.sanitize_filename(text, restricted=False)[:120].rstrip(" .") or "video"
+
+
+def choose_name(output, base, audio, reserved):
+    """Returns a free name.
+
+    First file with that name: "name". If another one arrives, the existing one becomes
+    "name_01" and the new one is saved as "name_02", then "name_03"...
+    The MP3 and the MP4 of the same video can share a name.
+    """
+    want = "audio" if audio else "video"
+    occupied = set(reserved)
+    finals = {}
+    if output.exists():
+        for path in output.iterdir():
+            match = FILE_RE.match(path.name)
+            if not match:
+                continue
+            stem = match["stem"].casefold()
+            kind = "audio" if match["ext"].lower() == "mp3" else "video"
+            if match["partial"] or kind == want:
+                occupied.add(stem)
+            if not match["partial"] and kind == want:
+                finals.setdefault(stem, []).append((path, match.end("stem")))
+    key = base.casefold()
+    numbered = re.compile(re.escape(key) + r"_(\d+)$")
+    numbers = [int(m.group(1)) for stem in occupied if (m := numbered.match(stem))]
+    if key not in occupied and not numbers:
+        return base
+    if key in occupied:
+        for path, stem_end in finals.get(key, []):
+            target = path.with_name(path.name[:stem_end] + "_01" + path.name[stem_end:])
+            if not target.exists():
+                try:
+                    path.rename(target)
+                    # Its .srt subtitles (name.srt) follow it: name_01.srt
+                    old_stem = path.name[:stem_end]
+                    subs = list(output.glob(glob_escape(old_stem) + ".srt"))
+                    subs += list(output.glob(glob_escape(old_stem) + ".*.srt"))
+                    for sub in subs:
+                        sub.rename(sub.with_name(old_stem + "_01" + sub.name[len(old_stem):]))
+                except OSError:
+                    pass
+        numbers.append(1)
+    number = max(numbers) + 1
+    while f"{key}_{number:02d}" in occupied:
+        number += 1
+    return f"{base}_{number:02d}"
+
+
+class NameBook:
+    """Remembers the name given to each video so a retry uses the same one."""
+
+    def __init__(self):
+        self.assigned = {}
+        self.reserved = set()
+
+
+# ── Download options ──────────────────────────────────────────────────────
+SUB_CODES = {"es": ["es", "es-.*", "spa.*"], "en": ["en", "en-.*", "eng.*"]}
+
+
+def make_options(output, quality, audio=False, names=None, custom_name=None, referer=None):
+    import yt_dlp
+
+    names = names or NameBook()
+
+    def assign_name(info, *, incomplete=False):
+        if incomplete:
+            return None
+        identity = (info.get("extractor_key"), info.get("id"))
+        if identity not in names.assigned:
+            base = clean_name(custom_name) if custom_name else base_name(info)
+            name = choose_name(output, base, audio, names.reserved)
+            names.assigned[identity] = name
+            names.reserved.add(name.casefold())
+        info["streamfetch_name"] = names.assigned[identity]
+        return None
+
+    # Quality is chosen by the short side of the picture, so it works the same for
+    # horizontal (1920x1080) and vertical videos (1080x1920).
+    # "res:720" = the largest up to 720p; if the video has nothing that small,
+    # the lowest quality available (it never fails for lack of a format).
+    formats = "ba/b" if audio else "bv*+ba/b"
+    resolution = {"720": "res:720", "1080": "res:1080"}.get(quality, "res")
+    options = {
+        "format": formats,
+        # First the highest allowed resolution (720p, 1080p or the maximum) and, if tied,
+        # H.264 + AAC (editor friendly). Resolution always wins.
+        # If another format arrives, it is converted to H.264 + AAC at the end (see make_editor_fix).
+        "format_sort": ["acodec:aac"] if audio else [resolution, "fps", "vcodec:h264", "acodec:aac"],
+        "postprocessor_args": {"merger": ["-movflags", "+faststart"]},
+        "outtmpl": str(output / "%(streamfetch_name)s.%(ext)s"),
+        "match_filter": assign_name,
+        "windowsfilenames": True,
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "continuedl": True,
+        "retries": 3,
+        "fragment_retries": 10,  # long classes: a lost piece is retried, not the whole video
+        "socket_timeout": 30,
+        "concurrent_fragment_downloads": 8,
+        # Check the actual destination file instead of a permanent ID archive:
+        # deleting a video must allow downloading it again.
+        "overwrites": False,
+    }
+    if referer:
+        # The server only gives the stream to its own page: say we come from it.
+        origin = "{0.scheme}://{0.netloc}".format(urlparse(referer))
+        options["http_headers"] = {"Referer": referer, "Origin": origin}
+
+    if audio:
+        # MP3 with the video thumbnail as cover art.
+        options["writethumbnail"] = True
+        options["postprocessors"] = [
+            {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"},
+            {"key": "FFmpegMetadata", "add_metadata": True},
+            {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+        ]
+    return options
+
+
+def probe_info(path):
+    """Codecs, number of audio tracks and resolution of the file."""
+    import json
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height", "-of", "json",
+         str(path)], capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    streams = json.loads(result.stdout or "{}").get("streams", [])
+    videos = [s for s in streams if s.get("codec_type") == "video"]
+    audios = [s for s in streams if s.get("codec_type") == "audio"]
+    first = videos[0] if videos else {}
+    return {"video": first.get("codec_name"), "sound": audios[0].get("codec_name") if audios else None,
+            "audios": len(audios), "width": first.get("width") or 0, "height": first.get("height") or 0}
+
+
+VIDEO_ENCODERS = [
+    # NVIDIA, Intel or AMD graphics card (much faster); otherwise, the CPU.
+    ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]),
+    ("h264_qsv", ["-c:v", "h264_qsv", "-global_quality", "20", "-pix_fmt", "nv12"]),
+    ("h264_amf", ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-pix_fmt", "yuv420p"]),
+    ("libx264", ["-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p"]),
+]
+_available_encoders = None
+
+
+def video_encoders():
+    global _available_encoders
+    if _available_encoders is None:
+        listing = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+        _available_encoders = [(name, args) for name, args in VIDEO_ENCODERS if f" {name} " in listing]
+    return _available_encoders
+
+
+def media_duration(path):
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                            capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def run_ffmpeg(command, duration, notify):
+    """Runs FFmpeg reporting the percentage. Returns (ok, error message)."""
+    process = subprocess.Popen(command + ["-progress", "pipe:1", "-nostats"], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    for line in process.stdout:
+        if line.startswith("out_time_us=") and duration:
+            try:
+                notify("progress", min(99.0, int(line.split("=", 1)[1]) / 1_000_000 / duration * 100))
+            except ValueError:
+                pass
+    error = process.stderr.read()
+    return process.wait() == 0, error
+
+
+def make_editor_fix(downloader, notify, quality="original"):
+    """Last step: if the MP4 is not H.264 + AAC, converts it so video editors can read it."""
+    from yt_dlp.postprocessor.common import PostProcessor
+
+    class EditorCompat(PostProcessor):
+        def run(self, info):
+            path = info.get("filepath")
+            if not path or not shutil.which("ffprobe"):
+                return [], info
+            path = Path(path)
+            details = probe_info(path)
+            video, sound = details["video"], details["sound"]
+            if not video:
+                return [], info
+            self.report(info, details)
+            # If the site only offered more quality than requested (e.g. a reel only in 1080p
+            # when you chose 720p), it is scaled down so it takes the space you expect.
+            wanted = {"720": 720, "1080": 1080}.get(quality)
+            short = min(details["width"], details["height"])
+            scale = []
+            if wanted and short > wanted * 1.05:
+                size = f"-2:{wanted}" if details["width"] >= details["height"] else f"{wanted}:-2"
+                scale = ["-vf", f"scale={size}"]
+                notify("log", t("reduced", short=short, wanted=wanted))
+            fix_video = video != "h264" or bool(scale)
+            fix_audio = sound not in (None, "aac")
+            extra_audio = details["audios"] > 1
+            is_mp4 = path.suffix.lower() == ".mp4"
+            if is_mp4 and not fix_video and not fix_audio and not extra_audio:
+                return [], info
+            if extra_audio and not fix_video and not fix_audio and is_mp4:
+                # Several audio tracks confuse editors: only the main one is kept.
+                notify("log", t("audio_tracks", n=details["audios"]))
+            notify("status", t("converting_status"))
+            notify("log", t("converting_log", ext=path.suffix[1:], video=video, sound=sound or t("no_audio")))
+            notify("progress", 0)
+            target = path.with_suffix(".mp4")
+            temporary = target.with_name(target.stem + ".convert.mp4")
+            duration = media_duration(path)
+            encoders = video_encoders() if fix_video else [("copy", ["-c:v", "copy"])]
+            ok, error = False, ""
+            for name, video_args in encoders:
+                command = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                           "-map", "0:v:0", "-map", "0:a:0?", *scale, *video_args]
+                command += ["-c:a", "aac", "-b:a", "192k"] if fix_audio else ["-c:a", "copy"]
+                command += ["-movflags", "+faststart", str(temporary)]
+                ok, error = run_ffmpeg(command, duration, notify)
+                if ok:
+                    if fix_video:
+                        notify("log", t("converted_with", name=name))
+                    break
+                temporary.unlink(missing_ok=True)
+            if not ok:
+                notify("log", t("convert_failed") + error.strip()[-300:])
+                return [], info
+            temporary.replace(target)
+            if target != path:
+                path.unlink(missing_ok=True)
+                info["filepath"] = str(target)
+                info["ext"] = "mp4"
+            notify("progress", 100)
+            return [], info
+
+        def report(self, info, details):
+            """Reports the real quality obtained and whether the site offers nothing better."""
+            short = min(details["width"], details["height"]) or max(details["width"], details["height"])
+            if not short:
+                return
+            notify("log", t("resolution", w=details["width"], h=details["height"], short=short))
+            offered = [min(f.get("width") or 0, f.get("height") or 0) or (f.get("height") or 0)
+                       for f in info.get("formats") or [] if (f.get("vcodec") or "none") != "none"]
+            best = max(offered, default=0)
+            wanted = {"720": 720, "1080": 1080}.get(quality, 100000)
+            if short < min(wanted, 720) and (not best or best <= short):
+                notify("note", t("max_offered", short=short))
+
+    return EditorCompat(downloader)
+
+
+# ── Subtitles: from the site or created with AI (Whisper) ─────────────────
+WHISPER_MODEL = "small"  # good balance between quality and speed (~500 MB, downloaded once)
+MODELS = LIB / "modelos_ia"
+_whisper = None
+
+
+def make_recorder(downloader, files):
+    """Remembers the final path of each downloaded file (after conversions and moves)."""
+    from yt_dlp.postprocessor.common import PostProcessor
+
+    class Recorder(PostProcessor):
+        def run(self, info):
+            if info.get("filepath"):
+                files.append(Path(info["filepath"]))
+            return [], info
+
+    return Recorder(downloader)
+
+
+def srt_time(seconds):
+    ms = int(round(max(0.0, seconds) * 1000))
+    return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+
+
+def write_srt(path, cues):
+    lines = []
+    for number, (start, end, text) in enumerate(cues, 1):
+        lines += [str(number), f"{srt_time(start)} --> {srt_time(end)}", text, ""]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def whisper_model(notify):
+    """Loads Whisper once. Uses an NVIDIA card if it works; otherwise the CPU."""
+    global _whisper
+    if _whisper is None:
+        from faster_whisper import WhisperModel
+        if not any(MODELS.glob("models--*whisper-" + WHISPER_MODEL)):
+            notify("status", t("ai_model_download"))
+            notify("log", t("ai_model_download"))
+        device = "cpu"
+        try:
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                device = "cuda"
+        except Exception:
+            pass
+        if device == "cuda":
+            try:
+                _whisper = (WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float16",
+                                         download_root=str(MODELS)), "cuda")
+            except Exception:
+                device = "cpu"
+        if device == "cpu":
+            _whisper = (WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
+                                     download_root=str(MODELS)), "cpu")
+    return _whisper
+
+
+def load_audio(media):
+    """Audio as Whisper wants it (16 kHz mono), extracted with FFmpeg.
+    (Whisper's own reader breaks with recent versions of PyAV.)"""
+    import numpy as np
+    result = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(media), "-vn", "-f", "s16le",
+                             "-ac", "1", "-ar", "16000", "-"], capture_output=True,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip()[-300:] or "ffmpeg")
+    return np.frombuffer(result.stdout, np.int16).astype(np.float32) / 32768.0
+
+
+def transcribe(media, notify, cancelled):
+    """Listens to the file with Whisper. Returns (language, [(start, end, text)]) or None if stopped."""
+    global _whisper
+    audio = load_audio(media)
+    duration = len(audio) / 16000
+    for _ in range(2):
+        model, device = whisper_model(notify)
+        try:
+            segments, info = model.transcribe(audio, vad_filter=True)
+            cues = []
+            for segment in segments:
+                if cancelled():
+                    return None
+                text = segment.text.strip()
+                if text:
+                    cues.append((segment.start, segment.end, text))
+                if duration:
+                    notify("progress", min(99.0, segment.end / duration * 100))
+            return info.language, cues
+        except Exception:
+            if device != "cuda":
+                raise
+            # The graphics card failed (missing CUDA parts): try again on the CPU.
+            _whisper = (type(model)(WHISPER_MODEL, device="cpu", compute_type="int8",
+                                    download_root=str(MODELS)), "cpu")
+    return None
+
+
+def translate_lines(lines, source, target):
+    """Translates the subtitle lines (Google Translate, needs Internet). Keeps the line count."""
+    from deep_translator import GoogleTranslator
+    translator = GoogleTranslator(source="auto", target=target)  # auto: safer than Whisper's codes
+    result, chunk, size = [], [], 0
+    for line in lines + [None]:
+        if line is None or size + len(line) > 3500:
+            if chunk:
+                joined = translator.translate("\n".join(chunk)) or ""
+                parts = joined.split("\n")
+                if len(parts) != len(chunk):  # the lines got mixed up: one by one
+                    parts = [translator.translate(item) or item for item in chunk]
+                result += [part.strip() for part in parts]
+            chunk, size = [], 0
+        if line is not None:
+            chunk.append(line)
+            size += len(line) + 1
+    return result
+
+
+def fetch_site_subtitles(url, media, lang, options, logger=None):
+    """Second pass, only for subtitles: if the site refuses them, the video is already saved."""
+    import yt_dlp
+    options = dict(options)
+    for key in ("match_filter", "postprocessors", "writethumbnail", "progress_hooks"):
+        options.pop(key, None)
+    options.update({
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,  # automatic ones too, including YouTube's automatic translation
+        "subtitleslangs": SUB_CODES.get(lang, [lang, lang + "-.*"]),
+        "subtitlesformat": "srt/vtt/best",
+        "postprocessors": [{"key": "FFmpegSubtitlesConvertor", "format": "srt", "when": "before_dl"}],
+        "outtmpl": str(media.parent / (media.stem.replace("%", "%%") + ".%(ext)s")),
+        "ignoreerrors": True,
+        "quiet": True,
+        "noprogress": True,
+    })
+    if logger:
+        options["logger"] = logger
+    with yt_dlp.YoutubeDL(options) as downloader:
+        downloader.download([url])
+
+
+def make_subtitles(media, lang, notify, cancelled, fetch=None):
+    """Leaves name.srt next to the video: from the site if it gives them; if not, with Whisper."""
+    target = media.with_name(media.stem + ".srt")
+    if fetch:
+        try:
+            fetch()
+        except Exception as exc:  # no subtitles from the site: Whisper will make them
+            notify("log", t("warning") + str(exc)[-200:])
+    found = sorted(media.parent.glob(glob_escape(media.stem) + ".*.srt"))
+    if found:
+        keep = target if target in found else found[0]
+        for extra in found:
+            if extra != keep:
+                extra.unlink(missing_ok=True)
+        if keep != target:
+            keep.replace(target)
+        notify("log", t("subs_from_site", file=target.name))
+        return
+    try:
+        import faster_whisper  # noqa: F401
+    except Exception:
+        notify("log", t("ai_missing"))
+        return
+    notify("log", t("subs_with_ai"))
+    notify("status", t("subs_ai_status"))
+    notify("progress", 0)
+    try:
+        result = transcribe(media, notify, cancelled)
+    except Exception as exc:
+        notify("log", t("subs_failed") + str(exc)[-300:])
+        return
+    if result is None:
+        return
+    spoken, cues = result
+    if not cues:
+        notify("log", t("subs_no_speech"))
+        return
+    if spoken and spoken != lang:
+        notify("status", t("subs_translating"))
+        notify("log", t("subs_translating"))
+        try:
+            texts = translate_lines([text for _, _, text in cues], spoken, lang)
+            cues = [(start, end, text) for (start, end, _), text in zip(cues, texts)]
+        except Exception as exc:
+            notify("log", t("subs_no_translation") + str(exc)[-200:])
+    write_srt(target, cues)
+    notify("progress", 100)
+    notify("log", t("subs_ready", file=target.name))
+
+
+def remove_leftovers(output, names):
+    """Before retrying, deletes empty or partial leftovers from the failed attempt
+    (e.g. "The downloaded file is empty"), so the retry starts clean."""
+    for name in names.assigned.values():
+        for path in output.glob(glob_escape(name) + ".*"):
+            try:
+                if path.name.endswith((".part", ".ytdl", ".temp")) or path.stat().st_size == 0:
+                    path.unlink()
+            except OSError:
+                pass
+
+
+def glob_escape(text):
+    return re.sub(r"([*?\[])", r"[\1]", text)
+
+
+def download(url, output, quality, audio=False, extra=None, notify=None, cancelled=lambda: False,
+             referer=None, custom_name=None, subtitles=None):
+    """Downloads one stream link (.m3u8, .mpd, .mp4… or the page). Returns True if it finished correctly.
+
+    referer: the page the video comes from (if empty, it is guessed from the link).
+    With subtitles="es" (or "en"), it also leaves name.srt next to the video.
+    """
+    import datetime
+    import yt_dlp
+
+    notify = notify or (lambda kind, text="": None)
+    referer = referer or guess_referer(url)
+    expiry = link_expiry(url)
+    if expiry and expiry < datetime.datetime.now():
+        notify("log", t("link_expired", date=f"{expiry:%d-%m-%Y %H:%M}"))
+        return False
+    if referer:
+        notify("log", t("using_referer", page=referer))
+    names = NameBook()
+    options = make_options(output, quality, audio, names, custom_name, referer)
+    options.update(extra or {})
+    files = []
+    try:
+        with yt_dlp.YoutubeDL(options) as downloader:
+            if not audio:
+                downloader.add_post_processor(make_editor_fix(downloader, notify, quality), when="post_process")
+            downloader.add_post_processor(make_recorder(downloader, files), when="after_move")
+            if not downloader.download([url]):
+                if subtitles and files and not cancelled():
+                    media = files[-1]
+                    make_subtitles(media, subtitles, notify, cancelled, fetch=lambda: fetch_site_subtitles(
+                        url, media, subtitles, options, (extra or {}).get("logger")))
+                return True
+    except Exception as exc:
+        if cancelled():
+            return False
+        message = str(exc)
+        if "DRM" in message:
+            notify("log", t("drm"))
+        elif "403" in message or "Forbidden" in message:
+            notify("log", t("forbidden"))
+        elif "404" in message or "Not Found" in message:
+            notify("log", t("not_found"))
+        elif "Unsupported URL" in message:
+            notify("log", t("unsupported"))
+        elif not isinstance(exc, yt_dlp.utils.DownloadError):
+            notify("log", message)
+    finally:
+        if cancelled():
+            remove_leftovers(output, names)  # do not leave half-downloaded pieces behind
+    return False
+
+
+UPDATE_LOG = APP / "streamfetch_actualizar.log"
+
+
+def update():
+    """Installs / updates the download tool and the AI subtitle parts in SISTEMA.
+    Everything shown on screen is also saved to APP\\streamfetch_actualizar.log."""
+    import datetime
+    command = [sys.executable, "-m", "pip", "install", "--upgrade", "--target", str(LIB),
+               "yt-dlp[default]", "faster-whisper", "deep-translator"]
+    with UPDATE_LOG.open("w", encoding="utf-8") as log:
+        log.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} · {' '.join(command)}\n")
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                   encoding="utf-8", errors="replace")
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log.write(line)
+            log.flush()
+        code = process.wait()
+        log.write(f"\n--- exit code {code} ---\n")
+    return code
+
+
+def main():
+    if "--lang" in sys.argv[1:-1]:
+        set_language(sys.argv[sys.argv.index("--lang") + 1])
+    parser = argparse.ArgumentParser(description=t("c_description"))
+    parser.add_argument("urls", nargs="*")
+    parser.add_argument("--quality", choices=["720", "1080", "original"], default="original")
+    parser.add_argument("--mp3", action="store_true", help=t("c_help_mp3"))
+    parser.add_argument("--referer", "--pagina", dest="referer", help=t("c_help_referer"))
+    parser.add_argument("--nombre", "--name", dest="nombre", help=t("c_help_name"))
+    parser.add_argument("--lang", choices=LANGUAGES, help=t("c_help_lang"))
+    parser.add_argument("--srt", action="store_true", help=t("c_help_srt"))
+    parser.add_argument("--update", action="store_true")
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    if args.update:
+        return update()
+    import yt_dlp
+    if args.check:
+        print(t("c_tool"), yt_dlp.version.__version__)
+        for tool in ("ffmpeg", "ffprobe"):
+            print(tool + ":", shutil.which(tool) or t("c_not_found"))
+        print(t("c_destination"), DOWNLOADS)
+        return 0
+    if not shutil.which("ffmpeg"):
+        print(t("c_no_ffmpeg"))
+        return 1
+    urls = args.urls
+    quality = args.quality
+    audio = args.mp3
+    if not urls:
+        section(t("c_header"))
+        print(t("c_saved_in"))
+        section(t("c_step1"))
+        for key in ("c_opt1", "c_opt2", "c_opt3", "c_opt4", "c_opt0"):
+            print(t(key))
+        while True:
+            choice = input(t("c_choose")).strip()
+            if choice == "0":
+                return 0
+            if choice == "4":
+                quality, audio = "original", True
+                break
+            quality = {"": "original", "1": "720", "2": "1080", "3": "original"}.get(choice)
+            if quality:
+                break
+            print(t("c_bad_option"))
+        urls = collect_urls()
+    if not urls:
+        print(t("c_no_links"))
+        return 0
+    if any(not url.startswith(("https://", "http://")) for url in urls):
+        print(t("c_full_links"))
+        return 1
+    output = DOWNLOADS
+    output.mkdir(exist_ok=True)
+    section(t("c_running"))
+    print(t("c_in_list"), len(urls))
+    if audio:
+        print(t("c_format_mp3"))
+    else:
+        print(t("c_quality"), t("c_best") if quality == "original" else quality + "p")
+    print(t("c_save_in"), output)
+    print(t("c_ctrl_c"))
+    failures = 0
+    for index, url in enumerate(urls, 1):
+        section(t("c_link_of", i=index, n=len(urls)))
+        print("  " + url + "\n", flush=True)
+        if not download(url, output, quality, audio, referer=args.referer, custom_name=args.nombre,
+                        subtitles=get_language() if args.srt else None,
+                        notify=lambda kind, text="": kind != "progress" and print("  " + str(text))):
+            failures += 1
+    section(t("c_summary"))
+    print(t("c_ok", n=len(urls) - failures))
+    print(t("c_errors", n=failures))
+    print(t("c_folder"), output)
+    if failures:
+        print(t("c_repeat"))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, EOFError):
+        print(t("c_cancelled"))

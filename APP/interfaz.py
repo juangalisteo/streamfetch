@@ -1,0 +1,1357 @@
+"""StreamFetch · download window for streamed videos (shares its options with the console launcher).
+
+Project:   StreamFetch v1.0.0 (based on VideoFetch)
+Authors:   Juan Bautista Galisteo Marqués (@juangalisteo)
+           Juan Manuel Casado Triguero (@juanmacasado)
+License:   GPL-3.0-or-later (see LICENSE)
+Copyright (C) 2026 Juan Bautista Galisteo Marqués and Juan Manuel Casado Triguero.
+This program is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License, version 3 or (at your option) any later version.
+"""
+import importlib.util
+import os
+import queue
+import re
+import shutil
+import sys
+import threading
+import tkinter as tk
+import tkinter.font as tkfont
+from pathlib import Path
+from tkinter import messagebox
+
+sys.dont_write_bytecode = True  # no __pycache__ folders next to the program
+APP = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("descargador", APP / "descargador.py")
+core = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(core)
+ROOT, DOWNLOADS = core.ROOT, core.DOWNLOADS
+import yt_dlp
+from idiomas import t, get_language, set_language, LANGUAGES  # texts in Spanish and English
+
+APP_VERSION = "1.0.0"
+
+# Sharp text on scaled displays (Windows).
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    try:
+        # So the taskbar shows the StreamFetch icon instead of the Python one.
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("StreamFetch.App")
+    except Exception:
+        pass
+
+# ── Palette: monochrome graphite with a single signal colour (green) ─────
+BG = "#0B0B0C"
+SURFACE = "#121214"
+FIELD = "#18181B"
+RAISED = "#202024"
+BORDER = "#26262B"
+BORDER_STRONG = "#3A3A41"
+TEXT = "#F4F4F5"
+MUTED = "#A1A1AA"
+FAINT = "#5E5E66"
+ACCENT = "#22C55E"  # StreamFetch green (VideoFetch uses orange)
+ACCENT_SOFT = "#0E2A1A"
+ACCENT_PRESS = "#16A34A"
+ACCENT_HOVER = "#4ADE80"
+SUCCESS = "#34D399"
+WARNING = "#FBBF24"
+DANGER = "#F87171"
+
+SCALE = 1.0
+UI_ZOOM = 0.8
+F = {}
+
+
+def px(value):
+    return int(round(value * SCALE))
+
+
+def pick_family(*names):
+    available = set(tkfont.families())
+    for name in names:
+        if name in available:
+            return name
+    return "TkDefaultFont"
+
+
+def setup_fonts(root):
+    global SCALE
+    # The whole window 20 % smaller (text, buttons and spacing).
+    root.tk.call("tk", "scaling", float(root.tk.call("tk", "scaling")) * UI_ZOOM)
+    SCALE = root.winfo_fpixels("1i") / 96
+    ui = pick_family("Segoe UI Variable Text", "Segoe UI", "Inter", "DejaVu Sans")
+    display = pick_family("Segoe UI Variable Display", "Segoe UI", "Inter Display", "Inter", "DejaVu Sans")
+    semi = pick_family("Segoe UI Semibold", "Segoe UI Variable Text Semibold", "Inter SemiBold")
+    mono = pick_family("Cascadia Mono", "Consolas", "DejaVu Sans Mono")
+
+    def strong(size):
+        if semi != "TkDefaultFont":
+            return tkfont.Font(root, family=semi, size=size)
+        return tkfont.Font(root, family=ui, size=size, weight="bold")
+
+    F["title"] = tkfont.Font(root, family=display, size=28, weight="bold")
+    F["lead"] = tkfont.Font(root, family=ui, size=11)
+    F["body"] = tkfont.Font(root, family=ui, size=10)
+    F["input"] = tkfont.Font(root, family=ui, size=11)
+    F["small"] = tkfont.Font(root, family=ui, size=9)
+    F["brand"] = strong(12)
+    F["button"] = strong(10)
+    F["chip"] = strong(9)
+    F["tiny"] = tkfont.Font(root, family=ui, size=8)
+    F["mono"] = tkfont.Font(root, family=mono, size=9)
+    F["eyebrow"] = tkfont.Font(root, family=mono, size=8)
+
+
+def rounded_rect(canvas, x1, y1, x2, y2, r, **kw):
+    r = max(0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+    points = [
+        x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y1 + r,
+        x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2, x1 + r, y2, x1 + r, y2,
+        x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r, x1, y1 + r, x1, y1,
+    ]
+    return canvas.create_polygon(points, smooth=True, **kw)
+
+
+# ── Components ────────────────────────────────────────────────────────────
+class Button(tk.Canvas):
+    """Flat button with rounded corners, hover and disabled state."""
+
+    KINDS = {
+        # The main button is green; the others only lighten on hover.
+        "primary": dict(bg=ACCENT, hover=ACCENT_HOVER, press=ACCENT_PRESS, fg=BG, fg_hover=BG,
+                        border=None, off_bg="#1C1C20", off_fg="#55555C"),
+        "secondary": dict(bg=FIELD, hover=RAISED, press="#2A2A2F", fg=TEXT, fg_hover=TEXT,
+                          border=BORDER, off_bg=FIELD, off_fg=FAINT),
+        "ghost": dict(bg=None, hover=FIELD, press=RAISED, fg=MUTED, fg_hover=TEXT,
+                      border=None, off_bg=None, off_fg=FAINT),
+    }
+
+    def __init__(self, parent, text, command, kind="secondary", height=40, padx=18):
+        self.parent_bg = parent["bg"]
+        super().__init__(parent, bg=self.parent_bg, highlightthickness=0, bd=0, cursor="hand2")
+        self.text, self.command, self.kind = text, command, self.KINDS[kind]
+        self.h, self.padx = px(height), px(padx)
+        self.state, self.hover, self.pressed = "normal", False, False
+        self.bind("<Enter>", lambda e: self._set(hover=True))
+        self.bind("<Leave>", lambda e: self._set(hover=False, pressed=False))
+        self.bind("<ButtonPress-1>", lambda e: self._set(pressed=True))
+        self.bind("<ButtonRelease-1>", self._release)
+        self._draw()
+
+    def _set(self, **values):
+        for key, value in values.items():
+            setattr(self, key, value)
+        self._draw()
+
+    def _release(self, event):
+        fire = self.pressed and self.hover and self.state == "normal"
+        self._set(pressed=False)
+        if fire and self.command:
+            self.command()
+
+    def _draw(self):
+        k = self.kind
+        self.delete("all")
+        w = F["button"].measure(self.text) + 2 * self.padx
+        tk.Canvas.configure(self, width=w, height=self.h)
+        if self.state == "disabled":
+            bg, fg = k["off_bg"], k["off_fg"]
+        elif self.pressed and self.hover:
+            bg, fg = k["press"], k.get("fg_hover", k["fg"])
+        elif self.hover:
+            bg, fg = k["hover"], k.get("fg_hover", k["fg"])
+        else:
+            bg, fg = k["bg"], k["fg"]
+        bg = bg or self.parent_bg
+        outline = k["border"] if k["border"] and self.state != "disabled" and not self.hover else bg
+        rounded_rect(self, 1, 1, w - 1, self.h - 1, px(9), fill=bg, outline=outline)
+        self.create_text(w / 2, self.h / 2, text=self.text, fill=fg, font=F["button"])
+
+    def configure(self, **kw):
+        redraw = False
+        if "text" in kw:
+            self.text = kw.pop("text")
+            redraw = True
+        if "state" in kw:
+            self.state = kw.pop("state")
+            tk.Canvas.configure(self, cursor="hand2" if self.state == "normal" else "arrow")
+            redraw = True
+        if kw:
+            tk.Canvas.configure(self, **kw)
+        if redraw:
+            self._draw()
+
+    config = configure
+
+
+class Panel(tk.Canvas):
+    """Container with a rounded background and thin border. Children go in .inner."""
+
+    def __init__(self, parent, bg=SURFACE, border=BORDER, radius=16, pad=24):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0, width=1, height=1)
+        self.fill, self.border, self.radius, self.pad = bg, border, px(radius), px(pad)
+        self.inner = tk.Frame(self, bg=bg)
+        self.window = self.create_window(self.pad, self.pad, window=self.inner, anchor="nw")
+        self.bind("<Configure>", self._redraw)
+        self.inner.bind("<Configure>", self._fit)
+        self.after_idle(self._fit)
+
+    def _fit(self, event=None):
+        if not self.winfo_exists():  # the window has been redrawn (language change)
+            return
+        tk.Canvas.configure(self, height=self.inner.winfo_reqheight() + 2 * self.pad)
+
+    def _redraw(self, event):
+        self.delete("shape")
+        rounded_rect(self, 1, 1, event.width - 1, event.height - 1, self.radius,
+                     fill=self.fill, outline=self.border, tags="shape")
+        self.tag_lower("shape")
+        self.itemconfigure(self.window, width=max(1, event.width - 2 * self.pad),
+                           height=max(1, event.height - 2 * self.pad))
+
+    def set_border(self, color):
+        self.itemconfigure("shape", outline=color)
+
+
+class Chip(tk.Canvas):
+    """Pill-shaped label."""
+
+    def __init__(self, parent, text, fg=MUTED, bg=None, border=BORDER, font=None):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0)
+        self.fg, self.fill, self.border = fg, bg or parent["bg"], border
+        self.font = font or F["chip"]
+        self.set_text(text)
+
+    def set_text(self, text, fg=None):
+        self.fg = fg or self.fg
+        self.delete("all")
+        w, h = self.font.measure(text) + px(22), px(26)
+        tk.Canvas.configure(self, width=w, height=h)
+        rounded_rect(self, 1, 1, w - 1, h - 1, h / 2, fill=self.fill, outline=self.border)
+        self.create_text(w / 2, h / 2, text=text, fill=self.fg, font=self.font)
+
+
+class Segmented(tk.Canvas):
+    """Segmented selector: the chosen option is highlighted in green."""
+
+    def __init__(self, parent, options, index=0, command=None, min_width=0, compact=False):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0, cursor="hand2")
+        self.options, self.index, self.command = options, index, command
+        self.state, self.hovered = "normal", None
+        self.font = F["tiny"] if compact else F["button"]
+        self.inset, self.h = (px(2), px(22)) if compact else (px(4), px(40))
+        self.radius = px(8) if compact else px(11)
+        # Every option gets the same width, so the spacing between them is even.
+        widest = max(self.font.measure(o) for o in options) + (px(20) if compact else px(34))
+        widths = [widest] * len(options)
+        extra = max(0, px(min_width) - sum(widths) - 2 * self.inset)
+        self.widths = [w + extra / len(widths) for w in widths]
+        self.w = sum(self.widths) + 2 * self.inset
+        tk.Canvas.configure(self, width=self.w, height=self.h)
+        self.bind("<Motion>", self._motion)
+        self.bind("<Leave>", lambda e: self._hover(None))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _hit(self, x):
+        left = self.inset
+        for i, width in enumerate(self.widths):
+            if left <= x < left + width:
+                return i
+            left += width
+        return None
+
+    def _hover(self, index):
+        if index != self.hovered:
+            self.hovered = index
+            self._draw()
+
+    def _motion(self, event):
+        self._hover(self._hit(event.x) if self.state == "normal" else None)
+
+    def _click(self, event):
+        index = self._hit(event.x)
+        if self.state == "normal" and index is not None and index != self.index:
+            self.index = index
+            self._draw()
+            if self.command:
+                self.command(index)
+
+    def _draw(self):
+        self.delete("all")
+        off = self.state == "disabled"
+        rounded_rect(self, 1, 1, self.w - 1, self.h - 1, self.radius, fill=FIELD, outline=BORDER)
+        left = self.inset
+        for i, (text, width) in enumerate(zip(self.options, self.widths)):
+            if i == self.index:
+                rounded_rect(self, left, self.inset, left + width, self.h - self.inset, self.radius - px(3),
+                             fill=RAISED if off else ACCENT, outline=RAISED if off else ACCENT)
+                color = FAINT if off else BG
+            else:
+                color = FAINT if off else (TEXT if i == self.hovered else MUTED)
+            self.create_text(left + width / 2, self.h / 2, text=text, fill=color, font=self.font)
+            left += width
+
+    def current(self):
+        return self.index
+
+    def configure(self, **kw):
+        if "state" in kw:
+            self.state = "disabled" if kw.pop("state") == "disabled" else "normal"
+            tk.Canvas.configure(self, cursor="hand2" if self.state == "normal" else "arrow")
+            self.hovered = None
+            self._draw()
+        if kw:
+            tk.Canvas.configure(self, **kw)
+
+    config = configure
+
+
+class Toggle(tk.Canvas):
+    """Small on/off button: translucent red when off, green when on."""
+
+    OFF = dict(fill="#2A1315", outline="#5C1F24", text="#F87171", hover="#FCA5A5")
+    ON = dict(fill="#0E2A20", outline="#34D399", text="#34D399", hover="#6EE7B7")
+
+    def __init__(self, parent, text, value=False, command=None):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0, cursor="hand2")
+        self.text, self.value, self.command = text, value, command
+        self.state, self.hover = "normal", False
+        self.font = F["chip"]
+        self.w, self.h = self.font.measure(text) + px(26), px(28)  # smaller than the 720p / 1080p buttons
+        tk.Canvas.configure(self, width=self.w, height=self.h)
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _set_hover(self, value):
+        self.hover = value
+        self._draw()
+
+    def _click(self, event):
+        if self.state != "normal":
+            return
+        self.value = not self.value
+        self._draw()
+        if self.command:
+            self.command(self.value)
+
+    def _draw(self):
+        self.delete("all")
+        if self.state == "disabled":
+            fill, outline, color = FIELD, BORDER, FAINT
+        else:
+            look = self.ON if self.value else self.OFF
+            fill, outline = look["fill"], look["outline"]
+            color = look["hover"] if self.hover else look["text"]
+        rounded_rect(self, 1, 1, self.w - 1, self.h - 1, px(8), fill=fill, outline=outline)
+        self.create_text(self.w / 2, self.h / 2, text=self.text, fill=color, font=self.font)
+
+    def configure(self, **kw):
+        if "state" in kw:
+            self.state = "disabled" if kw.pop("state") == "disabled" else "normal"
+            tk.Canvas.configure(self, cursor="hand2" if self.state == "normal" else "arrow")
+            self._draw()
+        if kw:
+            tk.Canvas.configure(self, **kw)
+
+    config = configure
+
+
+class ScrollArea(tk.Frame):
+    """Scrollable area: on short screens nothing gets cut off.
+    Mouse wheel to scroll and a thin bar on the right (only shown when needed)."""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0)
+        self.bar = tk.Canvas(self, bg=BG, highlightthickness=0, bd=0, width=px(10))
+        self.content = tk.Frame(self.canvas, bg=BG)
+        self.window = self.canvas.create_window(0, 0, window=self.content, anchor="nw")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.span = (0.0, 1.0)
+        self.grab = None
+        self.canvas.configure(yscrollcommand=self._on_scroll)
+        self.canvas.bind("<Configure>", self._resize)
+        self.content.bind("<Configure>", self._resize)
+        self.bar.bind("<Configure>", lambda e: self._draw_bar())
+        self.bar.bind("<Button-1>", self._press)
+        self.bar.bind("<B1-Motion>", self._drag)
+        self.bar.bind("<ButtonRelease-1>", lambda e: setattr(self, "grab", None))
+        self.after(300, self.watch)
+        self.bind_all("<MouseWheel>", self._wheel, add="+")
+        self.bind_all("<Button-4>", lambda e: self._wheel(e, -1), add="+")
+        self.bind_all("<Button-5>", lambda e: self._wheel(e, 1), add="+")
+
+    def needed_height(self):
+        return self.content.winfo_reqheight()
+
+    def watch(self):
+        """If the content changes height (more boxes, activity...), it readjusts itself."""
+        if not self.winfo_exists():  # the window has been redrawn (language change)
+            return
+        needed = self.needed_height()
+        if needed != getattr(self, "last_needed", None):
+            self.last_needed = needed
+            self._resize()
+        self.after(150, self.watch)
+
+    def _resize(self, event=None):
+        width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
+        self.canvas.itemconfigure(self.window, width=width, height=max(height, self.needed_height()))
+        self.canvas.configure(scrollregion=(0, 0, width, max(height, self.needed_height())))
+
+    def _on_scroll(self, first, last):
+        self.span = (float(first), float(last))
+        if self.span[0] <= 0 and self.span[1] >= 1:
+            self.bar.pack_forget()
+        elif not self.bar.winfo_manager():
+            self.bar.pack(side="right", fill="y", before=self.canvas)
+        self._draw_bar()
+
+    def _draw_bar(self):
+        self.bar.delete("all")
+        h, w = self.bar.winfo_height(), px(10)
+        top, bottom = self.span[0] * h, self.span[1] * h
+        rounded_rect(self.bar, px(3), top + px(4), w - px(3), max(top + px(24), bottom - px(4)), px(3),
+                     fill=BORDER_STRONG, outline=BORDER_STRONG)
+
+    def _press(self, event):
+        h = max(1, self.bar.winfo_height())
+        top, bottom = self.span[0] * h, self.span[1] * h
+        self.grab = event.y - top if top <= event.y <= bottom else (bottom - top) / 2
+        self._drag(event)
+
+    def _drag(self, event):
+        h = max(1, self.bar.winfo_height())
+        self.canvas.yview_moveto((event.y - (self.grab or 0)) / h)
+
+    def _wheel(self, event, step=None):
+        if not self.winfo_exists():  # old area, already replaced after a language change
+            return
+        if step is None:
+            step = -1 if event.delta > 0 else 1
+        widget = event.widget
+        while isinstance(widget, tk.Misc):
+            target = getattr(widget, "wheel_target", None)
+            if target is not None:
+                target.yview_scroll(step, "units")
+                return
+            widget = widget.master
+        if isinstance(event.widget, tk.Text) or self.span == (0.0, 1.0):
+            return
+        self.canvas.yview_scroll(step * 3, "units")
+
+
+class SlimScrollbar(tk.Canvas):
+    """Thin scrollbar for a text box.
+    It appears on its own when there are more lines than fit. It can be dragged or clicked."""
+
+    def __init__(self, parent, target):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0, width=px(12), height=1,
+                         cursor="hand2")
+        self.target, self.span, self.grab, self.hover = target, (0.0, 1.0), None, False
+        target.configure(yscrollcommand=self.set)
+        self.bind("<Configure>", lambda e: self._draw())
+        self.bind("<Enter>", lambda e: self._hover(True))
+        self.bind("<Leave>", lambda e: self._hover(False))
+        self.bind("<Button-1>", self._press)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", lambda e: setattr(self, "grab", None))
+
+    def set(self, first, last):
+        self.span = (float(first), float(last))
+        if self.span[0] <= 0 and self.span[1] >= 1:
+            if self.winfo_manager():
+                self.pack_forget()
+        elif not self.winfo_manager():
+            self.pack(side="right", fill="y", padx=(0, px(4)), pady=px(6), before=self.target)
+        self._draw()
+
+    def _hover(self, value):
+        self.hover = value
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        h, w = self.winfo_height(), px(12)
+        top, bottom = self.span[0] * h, self.span[1] * h
+        color = ACCENT if self.hover or self.grab is not None else BORDER_STRONG
+        rounded_rect(self, px(3), top + px(2), w - px(3), max(top + px(20), bottom - px(2)), px(3),
+                     fill=color, outline=color)
+
+    def _press(self, event):
+        h = max(1, self.winfo_height())
+        top, bottom = self.span[0] * h, self.span[1] * h
+        # Click on the thumb: drag it. Click elsewhere: jump to that point.
+        self.grab = event.y - top if top <= event.y <= bottom else (bottom - top) / 2
+        self._drag(event)
+
+    def _drag(self, event):
+        h = max(1, self.winfo_height())
+        self.target.yview_moveto((event.y - (self.grab or 0)) / h)
+        self._draw()
+
+
+class NameField(tk.Frame):
+    """Name box (green text) with a small × to clear it."""
+
+    def __init__(self, parent, variable, on_return):
+        super().__init__(parent, bg=parent["bg"])
+        self.variable = variable
+        self.panel = Panel(self, bg=FIELD, border=BORDER, radius=10, pad=3)
+        self.panel.pack(fill="x")
+        row = tk.Frame(self.panel.inner, bg=FIELD)
+        row.pack(fill="x")
+        self.entry = tk.Entry(row, textvariable=variable, font=F["input"], bg=FIELD, fg=ACCENT,
+                              disabledbackground=FIELD, disabledforeground=ACCENT_PRESS,
+                              insertbackground=ACCENT, insertwidth=px(2), relief="flat", bd=0,
+                              highlightthickness=0, selectbackground=ACCENT_SOFT, selectforeground=TEXT)
+        self.entry.pack(side="left", fill="x", expand=True, padx=(px(8), 0), pady=px(4))
+        self.clear = tk.Label(row, text="×", width=2, font=F["brand"], fg=FAINT, bg=FIELD, cursor="hand2")
+        self.clear.pack(side="right", padx=(px(2), px(4)))
+        self.clear.bind("<Enter>", lambda e: self.clear.configure(fg=ACCENT))
+        self.clear.bind("<Leave>", lambda e: self.clear.configure(fg=FAINT))
+        self.clear.bind("<Button-1>", self._clear)
+        self.entry.bind("<FocusIn>", lambda e: self.panel.set_border(ACCENT))
+        self.entry.bind("<FocusOut>", lambda e: self.panel.set_border(BORDER))
+        self.entry.bind("<Return>", on_return)
+        self.trace = variable.trace_add("write", lambda *a: self._refresh())
+        self.bind("<Destroy>", self._forget, add="+")
+        self._refresh()
+
+    def _forget(self, event):
+        # When the list is rebuilt, the old box stops listening to name changes.
+        if event.widget is self and self.trace:
+            try:
+                self.variable.trace_remove("write", self.trace)
+            except tk.TclError:
+                pass
+            self.trace = None
+
+    def _refresh(self):
+        # The × is only shown when something is typed.
+        self.clear.configure(text="×" if self.variable.get() else "")
+
+    def _clear(self, event=None):
+        if str(self.entry["state"]) == "normal":
+            self.variable.set("")
+            self.entry.focus_set()
+
+    def set_state(self, state):
+        self.entry.configure(state=state)
+        self.clear.configure(cursor="hand2" if state == "normal" else "arrow")
+
+
+class IconButton(tk.Canvas):
+    """Tiny drawn button without text: "copy" (two sheets), "paste" (clipboard)
+    or "clear" (bin). Grey; green on hover; a green ✓ for a moment when clicked."""
+
+    def __init__(self, parent, kind, command, confirm=True):
+        size = px(18)
+        super().__init__(parent, width=size, height=size, bg=parent["bg"], highlightthickness=0, bd=0,
+                         cursor="hand2")
+        self.kind, self.command, self.confirm = kind, command, confirm
+        self.size, self.color, self.done, self.state = size, FAINT, False, "normal"
+        self.bind("<Enter>", lambda e: self._paint(ACCENT if self.state == "normal" else FAINT))
+        self.bind("<Leave>", lambda e: self._paint(FAINT))
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def _paint(self, color):
+        self.color = color
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        s, w = self.size, max(1, px(1.4))
+        color = self.color if self.state == "normal" else BORDER_STRONG
+        if self.done:
+            self.create_line(s * .2, s * .55, s * .42, s * .76, s * .82, s * .28, fill=SUCCESS, width=px(2))
+        elif self.kind == "copy":
+            self.create_rectangle(s * .35, s * .15, s * .85, s * .65, outline=color, width=w)
+            self.create_rectangle(s * .15, s * .35, s * .65, s * .85, outline=color, width=w, fill=self["bg"])
+        elif self.kind == "paste":
+            self.create_rectangle(s * .2, s * .22, s * .8, s * .88, outline=color, width=w)
+            self.create_rectangle(s * .36, s * .1, s * .64, s * .3, outline=color, width=w, fill=self["bg"])
+            self.create_line(s * .34, s * .5, s * .66, s * .5, fill=color, width=w)
+            self.create_line(s * .34, s * .68, s * .58, s * .68, fill=color, width=w)
+        elif self.kind == "clear":
+            self.create_line(s * .15, s * .27, s * .85, s * .27, fill=color, width=w)
+            self.create_line(s * .4, s * .27, s * .4, s * .15, s * .6, s * .15, s * .6, s * .27, fill=color, width=w)
+            self.create_polygon(s * .25, s * .33, s * .75, s * .33, s * .7, s * .88, s * .3, s * .88,
+                                outline=color, fill="", width=w)
+            self.create_line(s * .43, s * .45, s * .43, s * .76, fill=color, width=w)
+            self.create_line(s * .57, s * .45, s * .57, s * .76, fill=color, width=w)
+
+    def _click(self, event):
+        if self.state != "normal":
+            return
+        self.command()
+        if self.confirm:
+            self.done = True
+            self._draw()
+            self.after(1200, self._reset)
+
+    def _reset(self):
+        if not self.winfo_exists():
+            return
+        self.done = False
+        self._draw()
+
+    def set_state(self, state):
+        self.state = state
+        self.configure(cursor="hand2" if state == "normal" else "arrow")
+        self._draw()
+
+
+def fix_link(text):
+    """Returns the link ready to download, or None if it does not look like one.
+    Links pasted without https:// (youtube.com/..., youtu.be/...) get it added."""
+    if text.startswith(("https://", "http://")):
+        return text
+    if re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", text):
+        return "https://" + text
+    return None
+
+
+def short_link(url, size=30):
+    text = re.sub(r"^https?://(www\.)?", "", url)
+    return text if len(text) <= size else text[:size - 1] + "…"
+
+
+class Progress(tk.Canvas):
+    """Thin progress bar."""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=parent["bg"], highlightthickness=0, bd=0, height=px(4), width=1)
+        self.value, self.color = 0, ACCENT
+        self.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, value, color=None):
+        self.value = max(0, min(100, value))
+        self.color = color or self.color
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), px(4)
+        rounded_rect(self, 0, 0, w, h, h / 2, fill=FIELD, outline=FIELD)
+        filled = w * self.value / 100
+        if filled >= h:
+            rounded_rect(self, 0, 0, filled, h, h / 2, fill=self.color, outline=self.color)
+
+
+def make_logo(parent):
+    size = px(38)
+    c = tk.Canvas(parent, width=size, height=size, bg=parent["bg"], highlightthickness=0, bd=0)
+    rounded_rect(c, 0, 0, size, size, px(10), fill=ACCENT, outline=ACCENT)
+    w = max(2, px(2.8))
+    # Play triangle (a stream) over a line (saved to the computer).
+    c.create_polygon(size * 0.38, size * 0.22, size * 0.38, size * 0.60, size * 0.68, size * 0.41,
+                     fill=BG, outline=BG, joinstyle="round", width=max(1, px(1.5)))
+    c.create_line(size * 0.30, size * 0.76, size * 0.70, size * 0.76, fill=BG, width=w, capstyle="round")
+    return c
+
+
+def window_icon(root):
+    icon = tk.PhotoImage(width=32, height=32)
+    icon.put(ACCENT, to=(0, 0, 32, 32))
+    for y in range(5, 21):  # play triangle
+        icon.put(BG, to=(11, y, 12 + int((8 - abs(y - 12.5)) * 1.6), y + 1))
+    icon.put(BG, to=(9, 24, 23, 26))
+    root.iconphoto(True, icon)
+    root._icon = icon
+    ico = APP / "streamfetch.ico"
+    if sys.platform == "win32" and ico.exists():
+        try:
+            root.iconbitmap(default=str(ico))
+        except tk.TclError:
+            pass
+
+
+def dark_title_bar(root):
+    """Dark title bar in the same colour as the window (Windows 10/11)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        dwm = ctypes.windll.dwmapi
+        dark = ctypes.c_int(1)
+        for attribute in (20, 19):
+            if dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(dark), ctypes.sizeof(dark)) == 0:
+                break
+        r, g, b = (int(BG[i:i + 2], 16) for i in (1, 3, 5))
+        color = ctypes.c_int(r | (g << 8) | (b << 16))
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
+    except Exception:
+        pass
+
+
+def label(parent, text="", font="body", fg=TEXT, **kw):
+    return tk.Label(parent, text=text, font=F[font], fg=fg, bg=parent["bg"], **kw)
+
+
+def eyebrow(parent, number, text):
+    return label(parent, f"{number} — {text.upper()}", "eyebrow", FAINT)
+
+
+# Option texts (in the chosen language; see idiomas.py).
+def format_hints():
+    return [t("hint_mp4"), t("hint_mp3")]
+
+
+def quality_hints():
+    return [t("hint_720"), t("hint_1080"), t("hint_max")]
+
+
+QUALITY_KEYS = ["720", "1080", "original"]  # same order as the 720p / 1080p / Best buttons
+SETTINGS = APP / "streamfetch_ajustes.json"
+
+
+def load_settings():
+    try:
+        import json
+        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(**values):
+    try:
+        import json
+        data = load_settings()
+        data.update(values)
+        SETTINGS.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# ── Application ───────────────────────────────────────────────────────────
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.events = queue.Queue()
+        self.running = False
+        self.cancel = threading.Event()
+        setup_fonts(root)
+        root.title("StreamFetch")
+        root.configure(bg=BG)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        window_icon(root)
+        dark_title_bar(root)
+        self.name_vars = {}
+        # Origin page: kept between redraws and saved for the next time.
+        self.referer_var = tk.StringVar(value=load_settings().get("referer") or "")
+        self.referer_var.trace_add("write", lambda *a: (save_settings(referer=self.referer_var.get().strip()),
+                                                       self.update_referer_hint()))
+        self.build_ui()
+        self.fit_window()
+        self.root.after(100, self.poll)
+
+    def build_ui(self):
+        """Draws the whole window in the chosen language (repeated on language change)."""
+        root = self.root
+        self.card = None  # while drawing, do not recalculate heights of the previous window
+        self.area = ScrollArea(root)
+        self.area.pack(fill="both", expand=True)
+        frame = tk.Frame(self.area.content, bg=BG)
+        frame.pack(fill="both", expand=True, padx=px(36), pady=(px(28), px(30)))
+
+        # Header
+        header = tk.Frame(frame, bg=BG)
+        header.pack(fill="x")
+        make_logo(header).pack(side="left")
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(side="left", padx=(px(12), 0))
+        label(brand, "StreamFetch", "brand").pack(anchor="w")
+        label(brand, t("subtitle"), "small", MUTED).pack(anchor="w")
+        Chip(header, f"v{APP_VERSION}", fg=MUTED, font=F["mono"]).pack(side="right")
+        # Language: ES / EN, left of the version
+        self.language = Segmented(header, ["ES", "EN"], index=LANGUAGES.index(get_language()),
+                                  command=self.on_language, compact=True)
+        self.language.pack(side="right", padx=(0, px(10)))
+
+        # Intro
+        label(frame, t("title"), "title").pack(anchor="w", pady=(px(34), px(6)))
+        label(frame, t("lead"), "lead", MUTED).pack(anchor="w", pady=(0, px(28)))
+
+        # Main card
+        card = Panel(frame)
+        card.pack(fill="x")  # the card keeps its size; the links box does not stretch
+        body = card.inner
+
+        heading = tk.Frame(body, bg=SURFACE)
+        heading.pack(fill="x")
+        eyebrow(heading, "01", t("links")).pack(side="left")
+        self.counter = Chip(heading, t("videos", n=0), fg=MUTED)
+        self.counter.pack(side="right")
+        hint_row = tk.Frame(body, bg=SURFACE)
+        hint_row.pack(fill="x", pady=(px(2), px(14)))
+        label(hint_row, t("links_hint"), "body", MUTED).pack(side="left")
+        Button(hint_row, t("how_link"), self.show_how_link, kind="ghost", height=30, padx=10).pack(side="right")
+
+        self.field = Panel(body, bg=FIELD, border=BORDER, radius=12, pad=6)
+        self.field.pack(fill="x")  # fixed height (5 lines); more lines scroll inside
+        self.urls = tk.Text(self.field.inner, height=5, wrap="word", font=F["input"], undo=True,
+                            bg=FIELD, fg=TEXT, insertbackground=ACCENT, insertwidth=px(2),
+                            selectbackground=ACCENT_SOFT, selectforeground=TEXT, relief="flat", bd=0,
+                            highlightthickness=0, padx=px(10), pady=px(8))
+        icons = tk.Frame(self.field.inner, bg=FIELD)
+        icons.pack(side="right", fill="y", padx=(px(4), px(6)), pady=px(6))
+        self.paste_icon = IconButton(icons, "paste", self.paste_links, confirm=False)
+        self.paste_icon.pack(pady=(0, px(8)))
+        self.clear_icon = IconButton(icons, "clear", lambda: self.urls.delete("1.0", "end"), confirm=False)
+        self.clear_icon.pack()
+        self.urls.pack(fill="both", expand=True)
+        SlimScrollbar(self.field.inner, self.urls)
+        self.placeholder = tk.Label(self.urls, text=t("placeholder"), font=F["input"],
+                                    fg=FAINT, bg=FIELD, cursor="xterm")
+        self.placeholder.place(x=px(10), y=px(8))
+        self.placeholder.bind("<Button-1>", lambda e: self.urls.focus_set())
+        self.urls.bind("<<Modified>>", self.update_count)
+        self.urls.bind("<FocusIn>", lambda e: self.field.set_border(ACCENT))
+        self.urls.bind("<FocusOut>", lambda e: self.field.set_border(BORDER))
+        self.urls.bind("<Control-Return>", self.shortcut)
+        root.bind("<Control-Return>", self.shortcut)
+
+
+        def divider():
+            tk.Frame(body, bg=BORDER, height=1).pack(fill="x", pady=px(20))
+
+        def option_row(number, title, hint_var):
+            row = tk.Frame(body, bg=SURFACE)
+            row.pack(fill="x")
+            text = tk.Frame(row, bg=SURFACE)
+            text.pack(side="left", fill="x", expand=True)
+            eyebrow(text, number, title).pack(anchor="w")
+            label(text, textvariable=hint_var, font="body", fg=MUTED).pack(anchor="w", pady=(px(4), 0))
+            return row
+
+        divider()
+        # 02 · Origin page (Referer): empty = guessed from the link (Tella → https://www.tella.tv/)
+        eyebrow(body, "02", t("referer")).pack(anchor="w")
+        self.referer_hint = tk.StringVar(value=t("referer_hint"))
+        label(body, textvariable=self.referer_hint, font="body", fg=MUTED).pack(anchor="w", pady=(px(4), px(10)))
+        self.referer_field = NameField(body, self.referer_var, self.shortcut)
+        self.referer_field.pack(fill="x")
+
+        divider()
+        self.format_hint = tk.StringVar(value=format_hints()[0])
+        row = option_row("03", t("format"), self.format_hint)
+        self.media = Segmented(row, [t("format_mp4"), t("format_mp3")], index=0, command=self.on_format,
+                               min_width=250)
+        self.media.pack(side="right")
+
+        divider()
+        # The last quality chosen is remembered (first time: Best).
+        saved_quality = load_settings().get("quality")
+        quality_index = QUALITY_KEYS.index(saved_quality) if saved_quality in QUALITY_KEYS else 2
+        self.quality_hint = tk.StringVar(value=quality_hints()[quality_index])
+        row = option_row("04", t("quality"), self.quality_hint)
+        self.quality = Segmented(row, ["720p", "1080p", t("quality_max")], index=quality_index,
+                                 command=self.on_quality, min_width=250)
+        self.quality.pack(side="right")
+        # SRT: also save subtitles (from the site, or created with AI) in the window's language.
+        self.srt = Toggle(row, "SRT", value=bool(load_settings().get("subtitles")), command=self.on_srt)
+        self.srt.pack(side="right", padx=(0, px(10)))
+        self.update_quality_hint()
+
+        divider()
+        eyebrow(body, "05", t("file_name")).pack(anchor="w", pady=(0, px(10)))
+        # One box per link (with 0 or 1 link, just one). Empty = automatic name.
+        self.names_holder = tk.Frame(body, bg=SURFACE)
+        self.names_holder.pack(fill="x")
+        self.name_fields = []
+        self.shown_links = None
+        self.build_names([])
+
+        divider()
+        row = tk.Frame(body, bg=SURFACE)
+        row.pack(fill="x")
+        text = tk.Frame(row, bg=SURFACE)
+        text.pack(side="left", fill="x", expand=True)
+        eyebrow(text, "06", t("destination")).pack(anchor="w")
+        label(text, "STREAMFETCH \\ DOWNLOADS", "mono", TEXT).pack(anchor="w", pady=(px(5), 0))
+        Button(row, t("open_folder"), self.open_folder, height=36, padx=16).pack(side="right")
+
+
+        # Status and progress
+        status_row = tk.Frame(frame, bg=BG)
+        status_row.pack(fill="x", pady=(px(26), px(10)))
+        self.dot = tk.Canvas(status_row, width=px(8), height=px(8), bg=BG, highlightthickness=0, bd=0)
+        self.dot.create_oval(0, 0, px(8), px(8), fill=FAINT, outline="", tags="dot")
+        self.dot.pack(side="left", padx=(0, px(10)))
+        self.status = tk.StringVar(value=t("ready"))
+        label(status_row, textvariable=self.status, font="body", fg=TEXT, anchor="w").pack(
+            side="left", fill="x", expand=True)
+        self.percent = tk.StringVar(value="")
+        label(status_row, textvariable=self.percent, font="mono", fg=MUTED).pack(side="right")
+        self.progress = Progress(frame)
+        self.progress.pack(fill="x")
+
+        # Actions
+        actions = tk.Frame(frame, bg=BG)
+        actions.pack(fill="x", pady=(px(22), 0))
+        self.details_button = Button(actions, t("show_activity"), self.toggle_details, kind="ghost", height=40, padx=14)
+        self.details_button.pack(side="left")
+        self.start_button = Button(actions, t("download"), self.start, kind="primary", height=44, padx=26)
+        self.start_button.pack(side="right")
+        self.stop_button = Button(actions, t("stop"), self.stop, height=44, padx=20)
+        self.stop_button.configure(state="disabled")
+        self.stop_button.pack(side="right", padx=px(10))
+
+        self.details = Panel(frame, bg=FIELD, radius=12, pad=12)
+        self.log = tk.Text(self.details.inner, height=7, wrap="word", state="disabled", font=F["mono"],
+                           bg=FIELD, fg=MUTED, relief="flat", bd=0, highlightthickness=0,
+                           selectbackground=ACCENT_SOFT, padx=px(4), pady=px(2))
+        self.log.pack(fill="both", expand=True)
+        SlimScrollbar(self.details.inner, self.log)
+        self.copy_icon = IconButton(self.details.inner, "copy", self.copy_log)
+        self.copy_icon.place(relx=1.0, x=-px(18), y=px(2), anchor="ne")
+
+        self.card, self.frame = card, frame
+
+    def required_height(self):
+        """Real height the window needs (rounded cards are measured separately)."""
+        for _ in range(2):
+            self.root.update_idletasks()
+            self.field._fit()
+            self.referer_field.panel._fit()  # 02 · Origin page box (it must be measured too)
+            for field in self.name_fields:
+                field.panel._fit()
+            self.card._fit()
+            if self.details.winfo_manager():
+                self.details._fit()
+        self.root.update_idletasks()
+        return self.area.needed_height()
+
+    def fit_window(self):
+        """Opens the window at just the right size so nothing is cut off.
+        On short screens, it shrinks the links box and centres the window."""
+        usable = self.root.winfo_screenheight() - px(90)
+        for lines in (5, 4, 3):
+            self.urls.configure(height=lines)
+            needed = self.required_height()
+            if needed <= usable:
+                break
+        width = max(px(880), self.area.content.winfo_reqwidth())
+        height = min(needed, usable)
+        x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+        y = max(0, (usable - height) // 2)
+        self.root.geometry(f"{width}x{height}+{x}+{y}")
+        self.root.minsize(px(780), px(420))
+
+    # ── Interface helpers ──
+    def show_how_link(self):
+        messagebox.showinfo(t("how_link_title"), t("how_link_text"))
+
+    def first_link(self):
+        for line in self.urls.get("1.0", "end").splitlines():
+            if line.strip():
+                return fix_link(line.strip())
+        return None
+
+    def update_referer_hint(self):
+        """Under 02 · Origin page: which page will be used if the box is left empty."""
+        if not hasattr(self, "referer_hint"):
+            return
+        link = self.first_link()
+        guess = core.guess_referer(link) if link else None
+        if self.referer_var.get().strip() or not guess:
+            self.referer_hint.set(t("referer_hint"))
+        else:
+            self.referer_hint.set(t("referer_auto", page=guess))
+
+    def on_quality(self, index):
+        save_settings(quality=QUALITY_KEYS[index])
+        self.update_quality_hint()
+
+    def on_srt(self, value):
+        save_settings(subtitles=value)
+        self.update_quality_hint()
+
+    def update_quality_hint(self):
+        """Hint under 03 · Quality, plus "With .srt subtitles" when SRT is on."""
+        text = t("hint_quality_mp3") if self.audio() else quality_hints()[self.quality.current()]
+        if self.srt.value:
+            text += " · " + t("hint_srt")
+        self.quality_hint.set(text)
+
+    def on_language(self, index):
+        """Switches the language and redraws the window without losing what was typed."""
+        if self.running:
+            return
+        keep = dict(
+            lines=int(self.urls.cget("height")),
+            links=self.urls.get("1.0", "end-1c"),
+            media=self.media.current(),
+            quality=self.quality.current(),
+            details=bool(self.details.winfo_manager()),
+            log=self.log.get("1.0", "end-1c"),
+        )
+        set_language(LANGUAGES[index])
+        save_settings(language=LANGUAGES[index])
+        self.area.destroy()
+        self.build_ui()
+        self.urls.configure(height=keep["lines"])
+        if keep["links"]:
+            self.urls.insert("1.0", keep["links"])
+        if keep["media"]:
+            self.media.index = keep["media"]
+            self.media._draw()
+            self.on_format(keep["media"])
+        if keep["quality"] != self.quality.current():
+            self.quality.index = keep["quality"]
+            self.quality._draw()
+            self.update_quality_hint()
+        if keep["log"]:
+            self.write_log(keep["log"])
+        if keep["details"]:
+            self.toggle_details()
+        self.relayout()
+
+    def audio(self):
+        return self.media.current() == 1
+
+    def on_format(self, index):
+        self.format_hint.set(format_hints()[index])
+        self.quality.configure(state="disabled" if self.audio() else "normal")
+        self.update_quality_hint()
+
+    def set_dot(self, color):
+        self.dot.itemconfigure("dot", fill=color)
+
+    def shortcut(self, event=None):
+        if not self.running:
+            self.start()
+        return "break"
+
+    def paste_links(self):
+        if self.running:
+            return
+        try:
+            text = self.root.clipboard_get().strip()
+        except tk.TclError:
+            return
+        if text:
+            existing = self.urls.get("1.0", "end-1c")
+            self.urls.insert("end", ("\n" if existing and not existing.endswith("\n") else "") + text + "\n")
+            self.urls.see("end")
+
+    def update_count(self, event=None):
+        if not self.urls.edit_modified():
+            return
+        content = self.urls.get("1.0", "end")
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        count = len(set(lines))
+        repeated = len(lines) - count
+        text = t("videos", n=count)
+        if repeated:
+            text += " · " + t("repeated", n=repeated)
+        self.counter.set_text(text, fg=TEXT if count else MUTED)
+        if content.strip():
+            self.placeholder.place_forget()
+        else:
+            self.placeholder.place(x=px(10), y=px(8))
+        self.urls.edit_modified(False)
+        self.urls.see("insert")  # like a word processor: always show the line being typed
+        self.update_referer_hint()
+        self.build_names(list(dict.fromkeys(lines)))
+
+    def name_var(self, key):
+        if key not in self.name_vars:
+            self.name_vars[key] = tk.StringVar()
+        return self.name_vars[key]
+
+    def build_names(self, links):
+        """Rebuilds the list of name boxes when the links change."""
+        if tuple(links) == self.shown_links:
+            return
+        self.shown_links = tuple(links)
+        # Whatever was typed before pasting the first link moves to that link.
+        if links and self.name_vars.get("") and self.name_vars[""].get() and not self.name_var(links[0]).get():
+            self.name_var(links[0]).set(self.name_vars[""].get())
+            self.name_vars[""].set("")
+        for child in self.names_holder.winfo_children():
+            child.destroy()
+        self.name_fields = []
+        if len(links) <= 1:
+            field = NameField(self.names_holder, self.name_var(links[0] if links else ""), self.shortcut)
+            field.pack(fill="x")
+            self.name_fields.append(field)
+        else:
+            visible = 4
+            canvas = tk.Canvas(self.names_holder, bg=SURFACE, highlightthickness=0, bd=0, height=1)
+            inner = tk.Frame(canvas, bg=SURFACE)
+            window = canvas.create_window(0, 0, window=inner, anchor="nw")
+            canvas.pack(side="left", fill="x", expand=True, anchor="n")
+            for index, link in enumerate(links, 1):
+                row = tk.Frame(inner, bg=SURFACE)
+                row.pack(fill="x", pady=(0, px(6)))
+                tk.Label(row, text=f"{index:>2} · {short_link(link)}", font=F["mono"], fg=FAINT, bg=SURFACE,
+                         width=36, anchor="w").pack(side="left", padx=(0, px(10)))
+                field = NameField(row, self.name_var(link), self.shortcut)
+                field.pack(side="left", fill="x", expand=True)
+                self.name_fields.append(field)
+            for widget in (canvas, inner):
+                widget.wheel_target = canvas
+            inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=(0, 0, e.width, e.height)))
+            canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+            self.root.update_idletasks()
+            row_height = inner.winfo_reqheight() / len(links)
+            canvas.configure(height=int(row_height * min(len(links), visible)), yscrollincrement=int(row_height))
+            if len(links) > visible:
+                SlimScrollbar(self.names_holder, canvas)
+            for widget in inner.winfo_children():
+                widget.wheel_target = canvas
+        if self.running:
+            for field in self.name_fields:
+                field.set_state("disabled")
+        self.relayout()
+
+    def relayout(self):
+        """Recalculates heights when the content changes (more boxes, activity...)."""
+        if getattr(self, "card", None) is None:
+            return
+        self.required_height()
+        self.area._resize()
+
+    def toggle_details(self):
+        if self.details.winfo_manager():
+            self.details.pack_forget()
+            self.details_button.configure(text=t("show_activity"))
+            # Back to the window's normal height (it no longer stays tall).
+            usable = self.root.winfo_screenheight() - px(90)
+            self.root.geometry(f"{self.root.winfo_width()}x{min(usable, self.required_height())}")
+            self.area._resize()
+        else:
+            self.details.pack(fill="x", pady=(px(14), 0))
+            self.details_button.configure(text=t("hide_activity"))
+            needed = self.required_height()
+            self.area._resize()
+            usable = self.root.winfo_screenheight() - px(90)
+            self.root.geometry(f"{self.root.winfo_width()}x{min(usable, max(self.root.winfo_height(), needed))}")
+
+    def open_folder(self):
+        folder = DOWNLOADS
+        folder.mkdir(exist_ok=True)
+        os.startfile(str(folder))
+
+    def set_inputs(self, enabled):
+        state = "normal" if enabled else "disabled"
+        self.urls.configure(state=state, fg=TEXT if enabled else MUTED)
+        self.paste_icon.set_state(state)
+        self.clear_icon.set_state(state)
+        self.media.configure(state=state)
+        self.referer_field.set_state(state)
+        self.language.configure(state=state)
+        self.srt.configure(state=state)
+        for field in self.name_fields:
+            field.set_state(state)
+        self.quality.configure(state="normal" if enabled and not self.audio() else "disabled")
+        self.start_button.configure(state=state)
+        self.stop_button.configure(state="disabled" if enabled else "normal")
+
+    def copy_log(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log.get("1.0", "end-1c"))
+
+    def write_log(self, text):
+        self.log.configure(state="normal")
+        self.log.insert("end", text + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    # ── Download ──
+    def start(self):
+        lines = list(dict.fromkeys(line.strip() for line in self.urls.get("1.0", "end").splitlines() if line.strip()))
+        if not lines:
+            messagebox.showinfo(t("no_links_title"), t("no_links"))
+            return
+        typed = {}  # ready-to-download link -> line as the user typed it (name boxes use it)
+        for line in lines:
+            url = fix_link(line)
+            if not url:
+                messagebox.showinfo(t("bad_link_title"), t("bad_link", link=short_link(line, 70)))
+                return
+            typed.setdefault(url, line)
+        urls = list(typed)
+        if not shutil.which("ffmpeg"):
+            messagebox.showerror(t("no_ffmpeg_title"), t("no_ffmpeg"))
+            return
+        self.running = True
+        self.note = None
+        self.cancel.clear()
+        self.set_inputs(False)
+        self.set_dot(ACCENT)
+        self.progress.set(0, ACCENT)
+        self.percent.set("0 %")
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        quality = QUALITY_KEYS[self.quality.current()]
+        subtitles = get_language() if self.srt.value else None
+        referer = self.referer_var.get().strip() or None
+        names = {url: self.name_var(typed[url]).get().strip() for url in urls}
+        if len(urls) == 1 and not names[urls[0]]:
+            names[urls[0]] = self.name_var("").get().strip()
+        threading.Thread(target=self.download, args=(urls, quality, self.audio(), referer, names, subtitles),
+                         daemon=True).start()
+
+    def stop(self):
+        self.cancel.set()
+        self.status.set(t("stopping"))
+        self.set_dot(WARNING)
+        self.stop_button.configure(state="disabled")
+
+    def download(self, urls, quality, audio, referer=None, names=None, subtitles=None):
+        app = self
+
+        # yt-dlp errors that StreamFetch already explains with its own clear message
+        # (DRM, 403, 404, unsupported link): the English original is not shown.
+        known = ("DRM", "403", "Forbidden", "404", "Not Found", "Unsupported URL")
+
+        class Logger:
+            def debug(self, message):
+                if not message.startswith(("[debug]", "[DRM]")):
+                    app.events.put(("log", message))
+
+            def warning(self, message):
+                app.events.put(("log", t("warning") + message))
+
+            def error(self, message):
+                if not any(word in message for word in known):
+                    app.events.put(("log", message))
+
+        def hook(data):
+            if app.cancel.is_set():
+                raise yt_dlp.utils.DownloadError(t("stopped_by_user"))
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+            if data["status"] == "downloading" and total:
+                app.events.put(("progress", min(100, data.get("downloaded_bytes", 0) / total * 100)))
+            elif data["status"] == "finished":
+                app.events.put(("status", t("to_mp3") if audio else t("merging")))
+
+        def notify(kind, text=""):
+            if kind == "status":
+                app.events.put(("status", text))
+            elif kind == "progress":
+                app.events.put(("progress", text))
+            elif kind == "note":
+                app.events.put(("note", text))
+                app.events.put(("log", t("quality_log") + text))
+            elif kind == "incognito":
+                app.events.put(("status", text))
+                app.events.put(("log", "— " + text))
+                app.events.put(("progress", 0))
+            else:
+                app.events.put(("log", text))
+
+        extra = dict(logger=Logger(), progress_hooks=[hook], noprogress=True, quiet=True)
+        failures = 0
+        completed = 0
+        try:
+            output = DOWNLOADS
+            output.mkdir(exist_ok=True)
+            for index, url in enumerate(urls, 1):
+                if self.cancel.is_set():
+                    break
+                self.events.put(("status", t("downloading", i=index, n=len(urls))))
+                self.events.put(("progress", 0))
+                ok = core.download(url, output, quality, audio, extra=extra, notify=notify, referer=referer,
+                                   custom_name=(names or {}).get(url) or None,
+                                   cancelled=self.cancel.is_set, subtitles=subtitles)
+                if self.cancel.is_set():
+                    break
+                if ok:
+                    completed += 1
+                else:
+                    failures += 1
+        except Exception as exc:
+            failures += 1
+            self.events.put(("log", str(exc)))
+        finally:
+            self.events.put(("done", (completed, failures, self.cancel.is_set())))
+
+    def poll(self):
+        try:
+            while True:
+                kind, value = self.events.get_nowait()
+                if kind == "log":
+                    self.write_log(value)
+                elif kind == "progress":
+                    self.progress.set(value)
+                    self.percent.set(f"{value:.0f} %")
+                elif kind == "note":
+                    self.note = value
+                elif kind == "done":
+                    self.finish(*value)
+                elif not self.cancel.is_set():
+                    self.status.set(value)
+        except queue.Empty:
+            pass
+        self.root.after(100, self.poll)
+
+    def finish(self, completed, failures, stopped):
+        self.running = False
+        self.set_inputs(True)
+        done = t("downloaded", n=completed)
+        if stopped:
+            self.status.set(t("status_stopped", done=done) + (" · " + t("with_error", n=failures) if failures else ""))
+            color = WARNING
+        elif failures:
+            self.status.set(t("status_failed", done=done, errors=t("with_error", n=failures)))
+            color = DANGER if not completed else WARNING
+        else:
+            if self.note:
+                self.status.set(t("status_note", done=done, note=self.note))
+            else:
+                self.status.set(t("status_done", n=completed, done=done))
+            for variable in self.name_vars.values():
+                variable.set("")
+            color = SUCCESS
+            self.progress.set(100)
+            self.percent.set("100 %")
+        self.set_dot(color)
+        self.progress.set(self.progress.value, color)
+
+    def close(self):
+        if self.running:
+            messagebox.showinfo(t("busy_title"), t("busy"))
+            return
+        self.root.destroy()
+
+
+ERROR_LOG = APP / "streamfetch_errores.log"
+
+
+def log_error(*exc):
+    """If something fails, it is written to APP\\streamfetch_errores.log (so it can be fixed)."""
+    try:
+        import datetime
+        import traceback
+        with ERROR_LOG.open("a", encoding="utf-8") as file:
+            file.write(f"\n--- {datetime.datetime.now():%Y-%m-%d %H:%M:%S} · v{APP_VERSION} ---\n")
+            file.write("".join(traceback.format_exception(*exc)))
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    root.report_callback_exception = log_error
+    try:
+        App(root)
+    except Exception:
+        log_error(*sys.exc_info())
+        raise
+    root.mainloop()

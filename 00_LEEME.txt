@@ -1,0 +1,58 @@
+STREAMFETCH v1.0.0 - DESCARGADOR DE VIDEOS EN STREAMING
+(English: read 00_README_EN.txt)
+
+PARA QUE SIRVE
+Descarga videos de webs que no tienen boton de descarga (clases, cursos,
+webinars...) usando el enlace .m3u8 que recibe tu navegador.
+
+LA PRIMERA VEZ
+1. Copia la carpeta STREAMFETCH COMPLETA donde quieras.
+2. Doble clic en 02_ACTUALIZAR.cmd (instala yt-dlp y la IA de subtitulos).
+3. Doble clic en 03_CREAR_ACCESO_DIRECTO.cmd si quieres el icono en el escritorio.
+
+COMO CONSEGUIR EL ENLACE DEL VIDEO
+1. Abre la pagina del video en Chrome, Edge o Firefox.
+2. Pulsa F12 y entra en la pestana Red (Network).
+3. Escribe m3u8 en su buscador.
+4. Dale al Play al video: aparece una linea con m3u8.
+5. Clic derecho en ella -> Copiar -> Copiar URL.
+IMPORTANTE: estos enlaces caducan en unas horas. Copialo justo antes de descargar.
+(Estos pasos tambien estan en la ventana: boton "Como consigo el enlace?")
+
+COMO USARLO
+1. Doble clic en 01_DESCARGAR.cmd.
+2. 01 Enlace del video: pega el enlace (uno por linea si son varios).
+3. 02 Pagina de origen: dejala vacia (se pone sola) o escribe la web del video,
+   por ejemplo https://www.tella.tv/
+4. 03 Formato: MP4 (video) o MP3 (solo audio).
+5. 04 Calidad: 720p, 1080p o Maxima. Boton SRT: verde = tambien subtitulos.
+6. 05 Nombre: por ejemplo "Clase 3 - Diseno web". Vacio = nombre automatico.
+7. Pulsa Descargar. Los archivos van a la carpeta DOWNLOADS.
+
+SI SALE UN ERROR
+- "El enlace ha caducado" o "Acceso denegado": vuelve a copiar el enlace
+  (pasos de arriba) y revisa la pagina de origen.
+- "Protegido con DRM": ese video no se puede descargar.
+
+ESTRUCTURA DE LA CARPETA
+STREAMFETCH
+  00_LEEME.txt                  Estas instrucciones
+  01_DESCARGAR.cmd              Abre StreamFetch
+  02_ACTUALIZAR.cmd             Instala / pone al dia yt-dlp y la IA
+  03_CREAR_ACCESO_DIRECTO.cmd   Crea el acceso directo del escritorio
+  DOWNLOADS\                    Tus videos y audios
+  APP\                          El programa: codigo, icono y ajustes guardados
+  SISTEMA\                      Piezas internas (yt-dlp y demas). No tocar.
+  00_README_EN.txt              Estas instrucciones en ingles
+  AGENT_AI\ESTADO.md            Estado del proyecto para trabajar con la IA
+  README.md / README.es.md      Presentacion del proyecto (GitHub)
+  CHANGELOG.md / CHANGELOG.es.md  Historial de versiones
+  LICENSE                       Licencia GPL-3.0
+  docs\                         Imagenes del README
+
+USO RESPONSABLE
+Descarga solo videos a los que tienes acceso y permiso para guardar.
+StreamFetch no se salta DRM, inicios de sesion ni muros de pago.
+
+Autores: Juan Bautista Galisteo Marques (@juangalisteo)
+         Juan Manuel Casado Triguero (@juanmacasado)

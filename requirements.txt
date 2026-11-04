@@ -1,0 +1,6 @@
+# Piezas de Python que necesita StreamFetch / Python parts StreamFetch needs.
+# No hace falta instalarlas a mano: 02_ACTUALIZAR.cmd las instala en SISTEMA\
+# with:  python -m pip install --upgrade --target SISTEMA "yt-dlp[default]" faster-whisper deep-translator
+yt-dlp[default]
+faster-whisper   # subtítulos con IA / AI subtitles (Whisper)
+deep-translator  # traducción de los subtítulos / subtitle translation
