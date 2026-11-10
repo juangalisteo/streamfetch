@@ -5,7 +5,9 @@ DOWNLOADS/*
 # Piezas instaladas por 02_ACTUALIZAR.cmd (cada uno las instala en su equipo)
 SISTEMA/
 
-# Notas internas de trabajo con la IA y carpetas de subida
+# Sistema de trabajo con la IA (privado) y carpetas de subida
+00_INICIO_CHAT.md
+00_CONFIG/
 AGENT_AI/
 PARA_GITHUB/
 SUBIR/
